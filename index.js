@@ -49,7 +49,11 @@ function getCachedPath(pathname, root) {
   var cacheKey = root + '::' + pathname
 
   if (pathCache.has(cacheKey)) {
-    return pathCache.get(cacheKey)
+    // touch entry for simple LRU behavior: delete+set preserves recency
+    var current = pathCache.get(cacheKey)
+    pathCache.delete(cacheKey)
+    pathCache.set(cacheKey, current)
+    return current
   }
 
   // If cache is full, delete oldest entry (first in Map)
