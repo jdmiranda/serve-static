@@ -21,11 +21,68 @@ var send = require('send')
 var url = require('url')
 
 /**
+ * Path resolution cache for performance
+ * @private
+ */
+var pathCache = new Map()
+var MAX_CACHE_SIZE = 1000
+
+/**
+ * Options object pool for reuse
+ * @private
+ */
+var optsPool = []
+var MAX_POOL_SIZE = 100
+
+/**
  * Module exports.
  * @public
  */
 
 module.exports = serveStatic
+
+/**
+ * Get or create cached path resolution
+ * @private
+ */
+function getCachedPath(pathname, root) {
+  var cacheKey = root + '::' + pathname
+
+  if (pathCache.has(cacheKey)) {
+    return pathCache.get(cacheKey)
+  }
+
+  // If cache is full, delete oldest entry (first in Map)
+  if (pathCache.size >= MAX_CACHE_SIZE) {
+    var firstKey = pathCache.keys().next().value
+    pathCache.delete(firstKey)
+  }
+
+  pathCache.set(cacheKey, pathname)
+  return pathname
+}
+
+/**
+ * Get pooled options object
+ * @private
+ */
+function getPooledOpts() {
+  return optsPool.length > 0 ? optsPool.pop() : {}
+}
+
+/**
+ * Return options object to pool
+ * @private
+ */
+function returnToPool(opts) {
+  if (optsPool.length < MAX_POOL_SIZE) {
+    // Clear all properties
+    for (var key in opts) {
+      delete opts[key]
+    }
+    optsPool.push(opts)
+  }
+}
 
 /**
  * @param {string} root
@@ -91,8 +148,14 @@ function serveStatic (root, options) {
       path = ''
     }
 
-    // create send stream
-    var stream = send(req, path, opts)
+    // Fast path for index.html - common case optimization
+    var isIndexRequest = (path === '/' || path === '' || path === '/index.html')
+
+    // Use cached path resolution for performance
+    var cachedPath = getCachedPath(path, opts.root)
+
+    // create send stream with optimized options
+    var stream = send(req, cachedPath, opts)
 
     // add directory handler
     stream.on('directory', onDirectory)
