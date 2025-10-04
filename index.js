@@ -19,6 +19,8 @@ var parseUrl = require('parseurl')
 var resolve = require('path').resolve
 var send = require('send')
 var url = require('url')
+var fs = require('fs')
+var pathModule = require('path')
 
 /**
  * Path resolution cache for performance
@@ -123,6 +125,8 @@ function serveStatic (root, options) {
   // setup options for send
   opts.maxage = opts.maxage || opts.maxAge || 0
   opts.root = resolve(root)
+  // opt-in precompressed asset serving
+  var preferPrecompressed = opts.preferPrecompressed === true
 
   // construct directory listener
   var onDirectory = redirect
@@ -158,16 +162,53 @@ function serveStatic (root, options) {
     // Use cached path resolution for performance
     var cachedPath = getCachedPath(path, opts.root)
 
+    var precompressed = null
+    var encoding = null
+    if (preferPrecompressed) {
+      // Only attempt if client accepts compressed encodings
+      var ae = (req.headers['accept-encoding'] || '')
+      var acceptBr = ae.indexOf('br') !== -1
+      var acceptGzip = ae.indexOf('gzip') !== -1
+
+      // Derive absolute file path for lookup
+      // Resolve index.html as a common case
+      var candidate = cachedPath
+      if (candidate === '' || candidate === '/') candidate = '/index.html'
+      var abs = pathModule.join(opts.root, candidate)
+      // Try brotli first
+      if (acceptBr && fs.existsSync(abs + '.br')) {
+        precompressed = candidate + '.br'
+        encoding = 'br'
+      } else if (acceptGzip && fs.existsSync(abs + '.gz')) {
+        precompressed = candidate + '.gz'
+        encoding = 'gzip'
+      }
+    }
+
     // create send stream with optimized options
-    var stream = send(req, cachedPath, opts)
+    var stream = send(req, precompressed || cachedPath, opts)
 
     // add directory handler
     stream.on('directory', onDirectory)
 
     // add headers listener
-    if (setHeaders) {
-      stream.on('headers', setHeaders)
-    }
+    stream.on('headers', function onHeaders (res, filePath, stat) {
+      // Always vary on encoding when serving static assets
+      res.setHeader('Vary', 'Accept-Encoding')
+      if (precompressed && encoding) {
+        // Reset content type to original path's type
+        try {
+          // send.mime.lookup is available on send module
+          var originalPath = precompressed.replace(/\.(br|gz)$/,'')
+          var type = send.mime.lookup(originalPath)
+          if (type) res.setHeader('Content-Type', type)
+        } catch (e) { /* ignore */ }
+        res.setHeader('Content-Encoding', encoding)
+        // Adjust content-length since precompressed file is smaller
+        res.setHeader('Content-Length', stat.size)
+      }
+      if (setHeaders) setHeaders(res, filePath, stat)
+    })
 
     // add file listener for fallthrough
     if (fallthrough) {
