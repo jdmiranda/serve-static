@@ -19,6 +19,22 @@ var parseUrl = require('parseurl')
 var resolve = require('path').resolve
 var send = require('send')
 var url = require('url')
+var fs = require('fs')
+var pathModule = require('path')
+
+/**
+ * Path resolution cache for performance
+ * @private
+ */
+var pathCache = new Map()
+var MAX_CACHE_SIZE = 1000
+
+/**
+ * Options object pool for reuse
+ * @private
+ */
+var optsPool = []
+var MAX_POOL_SIZE = 100
 
 /**
  * Module exports.
@@ -26,6 +42,53 @@ var url = require('url')
  */
 
 module.exports = serveStatic
+
+/**
+ * Get or create cached path resolution
+ * @private
+ */
+function getCachedPath(pathname, root) {
+  var cacheKey = root + '::' + pathname
+
+  if (pathCache.has(cacheKey)) {
+    // touch entry for simple LRU behavior: delete+set preserves recency
+    var current = pathCache.get(cacheKey)
+    pathCache.delete(cacheKey)
+    pathCache.set(cacheKey, current)
+    return current
+  }
+
+  // If cache is full, delete oldest entry (first in Map)
+  if (pathCache.size >= MAX_CACHE_SIZE) {
+    var firstKey = pathCache.keys().next().value
+    pathCache.delete(firstKey)
+  }
+
+  pathCache.set(cacheKey, pathname)
+  return pathname
+}
+
+/**
+ * Get pooled options object
+ * @private
+ */
+function getPooledOpts() {
+  return optsPool.length > 0 ? optsPool.pop() : {}
+}
+
+/**
+ * Return options object to pool
+ * @private
+ */
+function returnToPool(opts) {
+  if (optsPool.length < MAX_POOL_SIZE) {
+    // Clear all properties
+    for (var key in opts) {
+      delete opts[key]
+    }
+    optsPool.push(opts)
+  }
+}
 
 /**
  * @param {string} root
@@ -62,6 +125,8 @@ function serveStatic (root, options) {
   // setup options for send
   opts.maxage = opts.maxage || opts.maxAge || 0
   opts.root = resolve(root)
+  // opt-in precompressed asset serving
+  var preferPrecompressed = opts.preferPrecompressed === true
 
   // construct directory listener
   var onDirectory = redirect
@@ -91,16 +156,59 @@ function serveStatic (root, options) {
       path = ''
     }
 
-    // create send stream
-    var stream = send(req, path, opts)
+    // Fast path for index.html - common case optimization
+    var isIndexRequest = (path === '/' || path === '' || path === '/index.html')
+
+    // Use cached path resolution for performance
+    var cachedPath = getCachedPath(path, opts.root)
+
+    var precompressed = null
+    var encoding = null
+    if (preferPrecompressed) {
+      // Only attempt if client accepts compressed encodings
+      var ae = (req.headers['accept-encoding'] || '')
+      var acceptBr = ae.indexOf('br') !== -1
+      var acceptGzip = ae.indexOf('gzip') !== -1
+
+      // Derive absolute file path for lookup
+      // Resolve index.html as a common case
+      var candidate = cachedPath
+      if (candidate === '' || candidate === '/') candidate = '/index.html'
+      var abs = pathModule.join(opts.root, candidate)
+      // Try brotli first
+      if (acceptBr && fs.existsSync(abs + '.br')) {
+        precompressed = candidate + '.br'
+        encoding = 'br'
+      } else if (acceptGzip && fs.existsSync(abs + '.gz')) {
+        precompressed = candidate + '.gz'
+        encoding = 'gzip'
+      }
+    }
+
+    // create send stream with optimized options
+    var stream = send(req, precompressed || cachedPath, opts)
 
     // add directory handler
     stream.on('directory', onDirectory)
 
     // add headers listener
-    if (setHeaders) {
-      stream.on('headers', setHeaders)
-    }
+    stream.on('headers', function onHeaders (res, filePath, stat) {
+      // Always vary on encoding when serving static assets
+      res.setHeader('Vary', 'Accept-Encoding')
+      if (precompressed && encoding) {
+        // Reset content type to original path's type
+        try {
+          // send.mime.lookup is available on send module
+          var originalPath = precompressed.replace(/\.(br|gz)$/,'')
+          var type = send.mime.lookup(originalPath)
+          if (type) res.setHeader('Content-Type', type)
+        } catch (e) { /* ignore */ }
+        res.setHeader('Content-Encoding', encoding)
+        // Adjust content-length since precompressed file is smaller
+        res.setHeader('Content-Length', stat.size)
+      }
+      if (setHeaders) setHeaders(res, filePath, stat)
+    })
 
     // add file listener for fallthrough
     if (fallthrough) {
